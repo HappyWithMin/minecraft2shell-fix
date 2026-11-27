@@ -1,13 +1,13 @@
 ﻿<#
-  Minecraft2Shell 自动修复脚本 v3 —— 扫描后交互确认(y/n)
+  Minecraft2Shell 自动修复脚本 v4 —— 按 freetype 库版本判定(不依赖版本名)
   ------------------------------------------------------------------
-  流程: 扫描所有版本并分类 -> 列出结果 -> 若有可自动修复项, 提示 y/n -> 选 y 才修复。
-  分类(按核心版本):
-    - 原版 26.x                : 用官方权威JSON整份覆盖 + 下载校验补丁库
-    - 合并式整合包(自带freetype,核心26.x): 外科式替换freetype条目 + 下载校验
-    - inheritsFrom 26.x        : 由父版本26.x修复覆盖(父版本在列表里会被一起修), 本体不改
-    - 核心 1.20.5~1.21.11      : 官方无补丁, 仅提示缓解
-    - 无freetype               : 不受影响
+  判定依据: 版本实际引用的 lwjgl-freetype 库版本(自身或经 inheritsFrom 继承):
+    - 已是 *-mojang-2.15.0            : 已修复
+    - 3.4.3 / 3.4.1 等有官方补丁的版本 : 可修复(换成对应 -mojang-2.15.0 并下载校验)
+    - 3.3.x 等无官方补丁              : 需缓解(关资源包/缓解模组)
+    - 无 freetype                    : 不受影响
+  整合包(Fabric/Forge/OptiFine 等)同样按其引用的 freetype 版本判定, 与名字无关。
+  流程: 扫描 -> 列出 -> 有可修复项提示 y/n -> 选 y 才修。
   安全: 改前备份 *.bak-mc2shell-<时间>; 下载逐个 SHA1 校验。
   用法:
     交互:  powershell -ExecutionPolicy Bypass -File mc2shell-fix.ps1
@@ -41,27 +41,41 @@ function Find-McRoots {
 }
 function RxVal($raw,$key){ ([regex]::Match($raw,'"'+$key+'"\s*:\s*"([^"]+)"')).Groups[1].Value }
 function FtCoordRaw($raw){ ([regex]::Match($raw,'"name"\s*:\s*"(org\.lwjgl:lwjgl-freetype:(?:(?!natives)[^"])+)"')).Groups[1].Value }
-function Is26($b){ $b -match '^26\.' }
 # freetype 条目按"分类器"归并(base / natives-windows ...), 与版本号无关, 用于跨版本匹配
 function FtKey($name){ $p=$name -split ':'; if($p.Count -ge 4){$p[3]}else{'base'} }
-function Resolve-Version($root,$id,$depth=0){
+# 取 lwjgl-freetype 坐标的纯版本号(去掉 -mojang-... 后缀): 3.4.3-mojang-2.15.0 -> 3.4.3
+function PlainVer($coord){ ($coord -split ':')[2] -replace '-mojang.*$','' }
+# 跟随 inheritsFrom 解析出"有效 freetype 坐标"
+function Resolve-Eff($root,$id,$depth=0){
   $vj=Join-Path "$root\versions\$id" "$id.json"
-  if (-not (Test-Path $vj) -or $depth -gt 5) { return @{own=$null;eff=$null;base=$id;inh=$null} }
+  if (-not (Test-Path $vj) -or $depth -gt 5) { return @{own=$null;eff=$null;inh=$null} }
   $raw=Get-Content $vj -Raw
   $own=FtCoordRaw $raw; $inh=RxVal $raw 'inheritsFrom'
-  $base= if($inh){$inh}else{ $cv=RxVal $raw 'clientVersion'; $jr=RxVal $raw 'jar'; $fml=([regex]::Match($raw,'--fml\.mcVersion"\s*,\s*"([^"]+)"')).Groups[1].Value; if($cv){$cv}elseif($jr){$jr}elseif($fml){$fml}else{$id} }
-  $eff=$own; if (-not $eff -and $inh){ $eff=(Resolve-Version $root $inh ($depth+1)).eff }
-  return @{own=$own;eff=$eff;base=$base;inh=$inh}
+  $eff=$own; if (-not $eff -and $inh){ $eff=(Resolve-Eff $root $inh ($depth+1)).eff }
+  return @{own=$own;eff=$eff;inh=$inh}
 }
 
-Write-Host "获取 Mojang 版本清单..." -ForegroundColor DarkGray
+Write-Host "获取 Mojang 版本清单与补丁库信息..." -ForegroundColor DarkGray
 $manifest=Invoke-RestMethod $MANIFEST
 $byId=@{}; $manifest.versions | ForEach-Object { $byId[$_.id]=$_.url }
 $offCache=@{}
 function Get-OfficialJson($id){ if($offCache.ContainsKey($id)){return $offCache[$id]}; $r= if($byId.ContainsKey($id)){Invoke-RestMethod $byId[$id]}else{$null}; $offCache[$id]=$r; $r }
-function Download-FtLibs($root,$offJson){
+
+# 构建补丁映射: 纯版本(3.4.3/3.4.1) -> 该版本补丁版的 freetype 库条目(取自官方 26.x JSON)
+$patchMap=@{}
+foreach($cid in @('26.3','26.2','26.1')){
+  $oj=Get-OfficialJson $cid
+  if(-not $oj){ continue }
+  $ft=@($oj.libraries | Where-Object { $_.name -match 'lwjgl-freetype' })
+  $baseEntry=$ft | Where-Object { $_.name -notmatch 'natives' } | Select-Object -First 1
+  if(-not $baseEntry -or $baseEntry.name -notmatch 'mojang-2\.15\.0'){ continue }
+  $plain=PlainVer $baseEntry.name
+  if(-not $patchMap.ContainsKey($plain)){ $patchMap[$plain]=$ft }
+}
+
+function Download-FtLibs($root,$ftEntries){
   $arch= if($env:PROCESSOR_ARCHITECTURE -eq 'ARM64'){'natives-windows-arm64'}else{'natives-windows'}
-  $need=$offJson.libraries | Where-Object { $_.name -match 'lwjgl-freetype' -and ($_.name -notmatch 'natives' -or $_.name -match [regex]::Escape($arch)) }
+  $need=$ftEntries | Where-Object { $_.name -notmatch 'natives' -or $_.name -match [regex]::Escape($arch) }
   $ok=$true
   foreach($e in $need){ $a=$e.downloads.artifact; $dst=Join-Path "$root\libraries" ($a.path -replace '/','\')
     New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
@@ -79,16 +93,17 @@ Write-Host "`n===== 扫描结果 =====" -ForegroundColor Cyan
 foreach($root in $roots){
   Write-Host "`n== $root ==" -ForegroundColor Cyan
   foreach($vdir in (Get-ChildItem "$root\versions" -Directory)){
-    $id=$vdir.Name; $vj=Join-Path $vdir.FullName "$id.json"; $r=Resolve-Version $root $id
-    if (-not $r.eff){ continue }
+    $id=$vdir.Name; $vj=Join-Path $vdir.FullName "$id.json"; $r=Resolve-Eff $root $id
+    if (-not $r.eff){ continue }                                   # 不含 freetype
     if ($r.eff -match 'mojang-2\.15\.0'){ Write-Host "  [已修复] $id" -ForegroundColor Green; $skip++; continue }
-    if (-not (Is26 $r.base)){ Write-Host "  [需缓解] $id  核心 $($r.base) 官方无补丁 -> 关资源包/缓解模组" -ForegroundColor Red; $mit++; continue }
     if (-not $r.own -and $r.inh){ Write-Host "  [继承]   $id  继承自 $($r.inh), 由父版本修复覆盖" -ForegroundColor DarkCyan; $inhc++; continue }
-    $off=Get-OfficialJson $r.base
-    if (-not $off){ Write-Host "  [待查]   $id  核心 $($r.base) 不在官方清单, 请手动处理" -ForegroundColor Magenta; continue }
-    $kind= if($id -eq $r.base){'原版'}else{'整合'}
-    Write-Host "  [可修复·$kind] $id  $($r.own) -> 补丁版" -ForegroundColor Yellow
-    $actions += @{ id=$id; vj=$vj; root=$root; base=$r.base; off=$off; kind=$kind; byIdUrl=$byId[$id] }
+    $plain=PlainVer $r.eff
+    if ($patchMap.ContainsKey($plain)){
+      Write-Host "  [可修复] $id  (freetype $plain -> 补丁版)" -ForegroundColor Yellow
+      $actions += @{ id=$id; vj=$vj; root=$root; plain=$plain; inManifest=$byId.ContainsKey($id) }
+    } else {
+      Write-Host "  [需缓解] $id  (freetype $plain, 官方无补丁) -> 关资源包/缓解模组" -ForegroundColor Red; $mit++
+    }
   }
 }
 Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
@@ -107,17 +122,20 @@ if (-not $Yes){
 Write-Host "`n===== 开始修复 =====" -ForegroundColor Cyan
 foreach($a in $actions){
   Write-Host "  修复 $($a.id) ..." -ForegroundColor White
+  $ft=$patchMap[$a.plain]
   $bak="$($a.vj).bak-mc2shell-$(Get-Date -Format yyyyMMddHHmmss)"; Copy-Item $a.vj $bak -Force
-  if ($a.kind -eq '原版'){
-    Invoke-WebRequest $a.byIdUrl -OutFile $a.vj
+  if ($a.inManifest){
+    # 原版: 用官方权威 JSON 整份覆盖(最稳)
+    Invoke-WebRequest $byId[$a.id] -OutFile $a.vj
   } else {
+    # 整合包: 外科式替换 freetype 条目, 保留其余配置
     $local= try { Get-Content $a.vj -Raw | ConvertFrom-Json } catch { $null }
     if (-not $local){ Write-Host "    -> 无法解析该整合JSON, 跳过(请手动替换freetype条目)" -ForegroundColor Red; continue }
-    $offFt=@{}; foreach($e in ($a.off.libraries | Where-Object {$_.name -match 'lwjgl-freetype'})){ $offFt[(FtKey $e.name)]=$e }
+    $offFt=@{}; foreach($e in $ft){ $offFt[(FtKey $e.name)]=$e }
     $local.libraries=@(foreach($lib in $local.libraries){ if($lib.name -match 'lwjgl-freetype'){ $k=FtKey $lib.name; if($offFt[$k]){$offFt[$k]}else{$lib} } else {$lib} })
     ($local | ConvertTo-Json -Depth 100) | Set-Content $a.vj -Encoding UTF8
   }
-  if (Download-FtLibs $a.root $a.off){ Write-Host "    -> 已修复并校验通过 (备份 $(Split-Path $bak -Leaf))" -ForegroundColor Green }
+  if (Download-FtLibs $a.root $ft){ Write-Host "    -> 已修复并校验通过 (备份 $(Split-Path $bak -Leaf))" -ForegroundColor Green }
   else { Write-Host "    -> 下载校验失败, 已保留备份 $(Split-Path $bak -Leaf), 请手动检查" -ForegroundColor Red }
 }
 Write-Host "`n完成。提示: 第三方启动器修复后不要再点'版本检查/文件校验', 以免覆盖。" -ForegroundColor Green

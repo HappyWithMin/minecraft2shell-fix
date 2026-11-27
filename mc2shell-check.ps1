@@ -1,14 +1,17 @@
 ﻿<#
-  Minecraft2Shell 自检脚本 (只读, 不修改任何文件) v2 —— 按核心版本判定, 支持整合包
-  判定: 解析每个版本"有效的 lwjgl-freetype 坐标"(自身或经 inheritsFrom 继承自父版本):
-        无坐标            -> 不受影响 (如 1.20.4 及更早)
-        坐标含 2.15.0     -> 已修复
-        坐标未打补丁 + 核心 26.x -> 可修复(官方有补丁库)
-        坐标未打补丁 + 其它       -> 易受攻击(官方暂无补丁, 需缓解)
+  Minecraft2Shell 自检脚本 (只读, 不修改任何文件, 离线) v3 —— 按 freetype 库版本判定
+  判定依据: 版本实际引用的 lwjgl-freetype 库版本(自身或经 inheritsFrom 继承):
+    无 freetype               -> 不受影响
+    已是 *-mojang-2.15.0       -> 已修复
+    3.4.3 / 3.4.1 (有官方补丁)  -> 可修复
+    其它(3.3.x 等, 无官方补丁)  -> 易受攻击, 需缓解
+  整合包同样按其引用的 freetype 版本判定, 与名字无关。
   用法: powershell -ExecutionPolicy Bypass -File mc2shell-check.ps1 [-McPath "...\.minecraft"]
 #>
 param([string]$McPath)
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference='SilentlyContinue'
+# 已知有官方补丁(-mojang-2.15.0)的 lwjgl-freetype 版本
+$PATCHABLE=@('3.4.3','3.4.1')
 
 function Find-McRoots {
   if ($McPath) { return @($McPath) }
@@ -28,50 +31,41 @@ function Find-McRoots {
   }
   $cands | Where-Object { Test-Path (Join-Path $_ 'versions') } | Select-Object -Unique
 }
-# 容错取字段(正则, 不依赖 ConvertFrom-Json, 整合包也能读)
-function RxVal($raw,$key){ ([regex]::Match($raw, '"'+$key+'"\s*:\s*"([^"]+)"')).Groups[1].Value }
-function FtCoordRaw($raw){ ([regex]::Match($raw, '"name"\s*:\s*"(org\.lwjgl:lwjgl-freetype:(?:(?!natives)[^"])+)"')).Groups[1].Value }
-
-# 解析某版本的"有效 freetype 坐标"与"核心版本", 跟随 inheritsFrom 链(最多5层)
-function Resolve-Version($root,$id,$depth=0){
-  $vj = Join-Path "$root\versions\$id" "$id.json"
-  if (-not (Test-Path $vj) -or $depth -gt 5) { return @{ coord=$null; base=$id } }
-  $raw = Get-Content $vj -Raw
-  $coord = FtCoordRaw $raw
-  $inh   = RxVal $raw 'inheritsFrom'
-  $base  = if ($inh) { $inh } else {
-             $cv = RxVal $raw 'clientVersion'; $jr = RxVal $raw 'jar'
-             $fml= ([regex]::Match($raw,'--fml\.mcVersion"\s*,\s*"([^"]+)"')).Groups[1].Value
-             if ($cv){$cv}elseif($jr){$jr}elseif($fml){$fml}else{$id}
-           }
-  if (-not $coord -and $inh) { $p = Resolve-Version $root $inh ($depth+1); return @{ coord=$p.coord; base=$base } }
-  return @{ coord=$coord; base=$base }
+function RxVal($raw,$key){ ([regex]::Match($raw,'"'+$key+'"\s*:\s*"([^"]+)"')).Groups[1].Value }
+function FtCoordRaw($raw){ ([regex]::Match($raw,'"name"\s*:\s*"(org\.lwjgl:lwjgl-freetype:(?:(?!natives)[^"])+)"')).Groups[1].Value }
+function PlainVer($coord){ ($coord -split ':')[2] -replace '-mojang.*$','' }
+function Resolve-Eff($root,$id,$depth=0){
+  $vj=Join-Path "$root\versions\$id" "$id.json"
+  if (-not (Test-Path $vj) -or $depth -gt 5) { return @{own=$null;eff=$null;inh=$null} }
+  $raw=Get-Content $vj -Raw
+  $own=FtCoordRaw $raw; $inh=RxVal $raw 'inheritsFrom'
+  $eff=$own; if (-not $eff -and $inh){ $eff=(Resolve-Eff $root $inh ($depth+1)).eff }
+  return @{own=$own;eff=$eff;inh=$inh}
 }
-function Is26($base){ $base -match '^26\.' }
 
-$roots = Find-McRoots
-if (-not $roots) { Write-Host "未找到 .minecraft 目录。可用 -McPath 指定。" -ForegroundColor Yellow; exit }
+$roots=Find-McRoots
+if (-not $roots){ Write-Host "未找到 .minecraft 目录。可用 -McPath 指定。" -ForegroundColor Yellow; exit }
 $vuln=0; $total=0
-foreach ($root in $roots) {
+foreach($root in $roots){
   Write-Host "`n== $root ==" -ForegroundColor Cyan
-  foreach ($vdir in (Get-ChildItem "$root\versions" -Directory)) {
-    $r = Resolve-Version $root $vdir.Name
-    if (-not $r.coord) { Write-Host ("  [无影响 ] {0,-28} 核心 {1}, 不含 FreeType" -f $vdir.Name,$r.base) -ForegroundColor Gray; continue }
+  foreach($vdir in (Get-ChildItem "$root\versions" -Directory)){
+    $r=Resolve-Eff $root $vdir.Name
+    if (-not $r.eff){ Write-Host ("  [无影响 ] {0,-28} 不含 FreeType" -f $vdir.Name) -ForegroundColor Gray; continue }
     $total++
-    if ($r.coord -match 'mojang-2\.15\.0') {
-      Write-Host ("  [已修复 ] {0,-28} 核心 {1}  ({2})" -f $vdir.Name,$r.base,$r.coord) -ForegroundColor Green
-    } elseif (Is26 $r.base) {
-      $vuln++; Write-Host ("  [可修复 ] {0,-28} 核心 {1}  未打补丁({2}) — 官方有补丁, 可自动修" -f $vdir.Name,$r.base,$r.coord) -ForegroundColor Yellow
+    if ($r.eff -match 'mojang-2\.15\.0'){ Write-Host ("  [已修复 ] {0,-28} ({1})" -f $vdir.Name,$r.eff) -ForegroundColor Green; continue }
+    $plain=PlainVer $r.eff
+    if ($PATCHABLE -contains $plain){
+      $vuln++; Write-Host ("  [可修复 ] {0,-28} freetype {1} — 官方有补丁, 可自动修" -f $vdir.Name,$plain) -ForegroundColor Yellow
     } else {
-      $vuln++; Write-Host ("  [易受攻击] {0,-28} 核心 {1}  未打补丁({2}) — 官方暂无补丁, 需缓解" -f $vdir.Name,$r.base,$r.coord) -ForegroundColor Red
+      $vuln++; Write-Host ("  [易受攻击] {0,-28} freetype {1} — 官方暂无补丁, 需缓解" -f $vdir.Name,$plain) -ForegroundColor Red
     }
   }
 }
 Write-Host "`n----------------------------------------" -ForegroundColor DarkGray
-if ($vuln -gt 0) {
+if ($vuln -gt 0){
   Write-Host "结果: $total 个使用 FreeType 的版本中, $vuln 个需要处理。" -ForegroundColor Red
-  Write-Host "  [可修复] 核心 26.x: 官方启动器完整启动一次, 或用 mc2shell-fix.ps1 -Apply, 或删版重装。"
-  Write-Host "  [易受攻击] 核心 1.20.5~1.21.11: 官方无补丁 -> 将'服务器资源包'设为'已禁用', 不加载来路不明资源包; 模组端可装 minecraft2shell-fix。"
+  Write-Host "  [可修复] 用官方启动器完整启动一次, 或运行 mc2shell-fix.ps1 / mc2shell一键修复.bat。"
+  Write-Host "  [易受攻击] 官方无补丁 -> 将'服务器资源包'设为'已禁用', 不加载来路不明资源包; 模组端装 minecraft2shell-fix。"
   Write-Host "  修复前不要接受任何服务器推送的资源包。"
 } else { Write-Host "结果: 未发现需要处理的版本。" -ForegroundColor Green }
 Write-Host "注: 本脚本只读取文件, 不做任何修改。"
