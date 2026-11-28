@@ -142,7 +142,7 @@ foreach($a in $actions){
     if (-not $local){ Write-Host "    -> 无法解析该整合JSON, 跳过(请手动替换freetype条目)" -ForegroundColor Red; continue }
     $offFt=@{}; foreach($e in $ft){ $offFt[(FtKey $e.name)]=$e }
     $local.libraries=@(foreach($lib in $local.libraries){ if($lib.name -match 'lwjgl-freetype'){ $k=FtKey $lib.name; if($offFt[$k]){$offFt[$k]}else{$lib} } else {$lib} })
-    ($local | ConvertTo-Json -Depth 100) | Set-Content $a.vj -Encoding UTF8
+    [System.IO.File]::WriteAllText($a.vj, ($local | ConvertTo-Json -Depth 100), (New-Object System.Text.UTF8Encoding($false)))
   }
   if (Download-FtLibs $a.root $ft){ Write-Host "    -> 已修复并校验通过 (备份 $(Split-Path $bak -Leaf))" -ForegroundColor Green }
   else { Write-Host "    -> 下载校验失败, 已保留备份 $(Split-Path $bak -Leaf), 请手动检查" -ForegroundColor Red }
